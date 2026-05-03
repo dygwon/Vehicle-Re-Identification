@@ -22,6 +22,7 @@ Notes for the eventual INT8 / Jetson Orin Nano deployment path:
 """
 
 import argparse
+import json
 import os
 import random
 import re
@@ -433,6 +434,9 @@ def main():
     )
 
     best_path = save_dir / f"{args.model_name}_veri776_best.pt"
+    log_path = save_dir / f"{args.model_name}_veri776_log.jsonl"
+    # Truncate any existing log from a prior run so we get a clean history.
+    log_path.write_text("")
     best_map = 0.0
 
     for epoch in range(args.epochs):
@@ -461,13 +465,21 @@ def main():
 
         scheduler.step()
         n = running["n"]
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            "lr": optimizer.param_groups[0]["lr"],
+            "ce": running["ce"] / n,
+            "tri": running["tri"] / n,
+            "total": running["total"] / n,
+            "time_sec": time.time() - t0,
+        }
         print(
             f"Epoch {epoch + 1:>3}/{args.epochs}  "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}  "
-            f"ce={running['ce'] / n:.4f}  "
-            f"tri={running['tri'] / n:.4f}  "
-            f"total={running['total'] / n:.4f}  "
-            f"time={time.time() - t0:.1f}s"
+            f"lr={epoch_metrics['lr']:.2e}  "
+            f"ce={epoch_metrics['ce']:.4f}  "
+            f"tri={epoch_metrics['tri']:.4f}  "
+            f"total={epoch_metrics['total']:.4f}  "
+            f"time={epoch_metrics['time_sec']:.1f}s"
         )
 
         if (epoch + 1) % args.eval_every == 0 or (epoch + 1) == args.epochs:
@@ -479,6 +491,14 @@ def main():
                 f"R1={cmc[0] * 100:.2f}  "
                 f"R5={cmc[4] * 100:.2f}  "
                 f"R10={cmc[9] * 100:.2f}"
+            )
+            epoch_metrics.update(
+                {
+                    "mAP": mAP,
+                    "rank1": float(cmc[0]),
+                    "rank5": float(cmc[4]),
+                    "rank10": float(cmc[9]),
+                }
             )
 
             if mAP > best_map:
@@ -494,6 +514,13 @@ def main():
                     best_path,
                 )
                 print(f"  -> saved new best (mAP={mAP * 100:.2f})")
+
+        # Append this epoch's metrics to the JSONL log. Flush + fsync so the
+        # log survives a crash or Ctrl-C cleanly.
+        with open(log_path, "a") as f:
+            f.write(json.dumps(epoch_metrics) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     # Produce a deployment-ready, backbone-only checkpoint from the best
     # mAP weights. This is what you'll feed into ONNX export / TensorRT
