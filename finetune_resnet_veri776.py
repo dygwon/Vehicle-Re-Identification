@@ -286,10 +286,17 @@ class ResNetReID(nn.Module):
 
         # Bag-of-Tricks: setting the last block's stride to 1 keeps more
         # spatial resolution before the global average pool, which gives
-        # ~1-2 mAP on ReID benchmarks essentially for free.
+        # ~1-2 mAP on ReID benchmarks essentially for free. The stride-2
+        # conv lives in a different place depending on block type:
+        #   BasicBlock (resnet18/34): stride is on conv1.
+        #   Bottleneck (resnet50):    stride is on conv2.
         if last_stride_one:
-            net.layer4[0].downsample[0].stride = (1, 1)
-            net.layer4[0].conv2.stride = (1, 1)
+            block = net.layer4[0]
+            if hasattr(block, "conv3"):  # Bottleneck has conv1/conv2/conv3
+                block.conv2.stride = (1, 1)
+            else:  # BasicBlock has conv1/conv2
+                block.conv1.stride = (1, 1)
+            block.downsample[0].stride = (1, 1)
 
         self.backbone = net
         self.feat_dim = feat_dim
