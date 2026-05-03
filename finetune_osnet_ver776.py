@@ -58,19 +58,24 @@ def parse_veri_xml(xml_path: Path):
     Returns dict: imageName -> (vehicleID, cameraID, colorID, typeID).
     Color/type IDs are 0-indexed in the returned dict.
     """
-    # The XML is gb2312 encoded; ET handles encoding via the declaration but be
-    # defensive in case of mismatch.
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-    except ET.ParseError:
-        with open(xml_path, "rb") as f:
-            data = f.read()
+    # The file declares encoding="gb2312", which Python's stdlib XML parser
+    # refuses to handle ("multi-byte encodings are not supported"). The
+    # content is actually ASCII -- attribute names and integer IDs -- so we
+    # read as bytes, decode manually, strip the encoding declaration, and
+    # parse the remaining string.
+    with open(xml_path, "rb") as f:
+        data = f.read()
+    text = None
+    for enc in ("gb2312", "gbk", "utf-8", "latin-1"):
         try:
-            text = data.decode("gb2312")
+            text = data.decode(enc)
+            break
         except UnicodeDecodeError:
-            text = data.decode("utf-8", errors="replace")
-        root = ET.fromstring(text)
+            continue
+    if text is None:
+        text = data.decode("latin-1", errors="replace")
+    text = re.sub(r"<\?xml[^?]*\?>", "", text, count=1)
+    root = ET.fromstring(text)
 
     out = {}
     for item in root.iter("Item"):
@@ -401,6 +406,8 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    # Static input shapes -- let cuDNN autotune the conv kernels.
+    torch.backends.cudnn.benchmark = True
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     device = pick_device()
