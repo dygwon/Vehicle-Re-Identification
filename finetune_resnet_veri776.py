@@ -1,19 +1,17 @@
 """
 finetune_resnet_veri776.py
 
-Fine-tune a ResNet backbone on VeRi-776 for vehicle re-identification, with
-auxiliary color and type classification heads to shape a stronger feature
-extractor.
+Fine-tune a ResNet backbone on VeRi-776 for vehicle re-identification.
+Training objective: ID cross-entropy + batch-hard triplet loss.
 
 Usage:
     python finetune_resnet_veri776.py --data-root /path/to/VeRi
 
-Dependencies: torch, torchvision, pillow, numpy. That's it.
+Dependencies: torch, torchvision, pillow, numpy.
 
 Notes for the eventual INT8 / Jetson Orin Nano deployment path:
-  * The color and type aux heads exist purely to shape a better backbone
-    during training; the deployment checkpoint contains the bare feature
-    extractor only.
+  * The deployment checkpoint contains the bare feature extractor only;
+    the ID classifier is dropped at export time.
   * `resnet50` is the standard ReID workhorse. Use `resnet18` or `resnet34`
     for a smaller / faster model if Orin Nano latency is tight.
   * Train at the resolution you intend to deploy at; static shapes are
@@ -28,7 +26,6 @@ import os
 import random
 import re
 import time
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
@@ -43,52 +40,12 @@ from torchvision import transforms
 
 VERI_FILENAME_RE = re.compile(r"^(\d+)_c(\d+)_")
 
-# VeRi-776 attribute taxonomies (from train_label.xml)
-NUM_COLORS = 10  # yellow, orange, green, gray, red, blue, white, golden, brown, black
-NUM_TYPES = 9  # sedan, SUV, van, hatchback, MPV, pickup, bus, truck, estate
-
 
 def parse_veri_filename(fn: str):
     m = VERI_FILENAME_RE.match(fn)
     if m is None:
         return None
     return int(m.group(1)), int(m.group(2))
-
-
-def parse_veri_xml(xml_path: Path):
-    """
-    Parse VeRi-776 train_label.xml or test_label.xml.
-    Returns dict: imageName -> (vehicleID, cameraID, colorID, typeID).
-    Color/type IDs are 0-indexed in the returned dict.
-    """
-    # The file declares encoding="gb2312", which Python's stdlib XML parser
-    # refuses to handle ("multi-byte encodings are not supported"). The
-    # content is actually ASCII -- attribute names and integer IDs -- so we
-    # read as bytes, decode manually, strip the encoding declaration, and
-    # parse the remaining string.
-    with open(xml_path, "rb") as f:
-        data = f.read()
-    text = None
-    for enc in ("gb2312", "gbk", "utf-8", "latin-1"):
-        try:
-            text = data.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        text = data.decode("latin-1", errors="replace")
-    text = re.sub(r"<\?xml[^?]*\?>", "", text, count=1)
-    root = ET.fromstring(text)
-
-    out = {}
-    for item in root.iter("Item"):
-        name = item.attrib["imageName"]
-        vid = int(item.attrib["vehicleID"])
-        cam = int(item.attrib["cameraID"].lstrip("c"))
-        color = int(item.attrib["colorID"]) - 1  # 1..10 -> 0..9
-        vtype = int(item.attrib["typeID"]) - 1  # 1..9  -> 0..8
-        out[name] = (vid, cam, color, vtype)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -104,11 +61,8 @@ class VeRi776(Dataset):
         image_train/   training images
         image_query/   eval queries
         image_test/    eval gallery
-        train_label.xml, test_label.xml  (only needed if use_attributes=True)
 
-    With use_attributes=True, __getitem__ returns 5-tuples:
-        (img, pid, camid, color, vtype)
-    Otherwise 3-tuples: (img, pid, camid)
+    __getitem__ returns 3-tuples: (img, pid, camid)
     """
 
     SPLIT_DIRS = {
@@ -117,29 +71,17 @@ class VeRi776(Dataset):
         "gallery": "image_test",
     }
 
-    def __init__(
-        self, root, split="train", transform=None, pid2label=None, use_attributes=False
-    ):
+    def __init__(self, root, split="train", transform=None, pid2label=None):
         assert split in self.SPLIT_DIRS
         self.root = Path(root)
         self.split = split
         self.transform = transform
-        self.use_attributes = use_attributes
 
         img_dir = self.root / self.SPLIT_DIRS[split]
         if not img_dir.is_dir():
             raise FileNotFoundError(f"Missing directory: {img_dir}")
 
-        attrs = None
-        if use_attributes:
-            xml_name = "train_label.xml" if split == "train" else "test_label.xml"
-            xml_path = self.root / xml_name
-            if not xml_path.is_file():
-                raise FileNotFoundError(f"use_attributes=True but {xml_path} not found")
-            attrs = parse_veri_xml(xml_path)
-
         samples, pids = [], set()
-        n_missing_attrs = 0
         for fn in sorted(os.listdir(img_dir)):
             if not fn.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
@@ -147,21 +89,8 @@ class VeRi776(Dataset):
             if parsed is None:
                 continue
             pid, camid = parsed
-            color, vtype = -1, -1
-            if attrs is not None:
-                if fn in attrs:
-                    _, _, color, vtype = attrs[fn]
-                else:
-                    n_missing_attrs += 1
-            samples.append([str(img_dir / fn), pid, camid, color, vtype])
+            samples.append([str(img_dir / fn), pid, camid])
             pids.add(pid)
-
-        if attrs is not None and n_missing_attrs > 0:
-            print(
-                f"  warning: {n_missing_attrs}/{len(samples)} {split} "
-                f"images missing XML entries; their aux color/type loss "
-                f"is masked out via ignore_index=-1."
-            )
 
         if split == "train":
             if pid2label is None:
@@ -177,12 +106,10 @@ class VeRi776(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        path, pid, camid, color, vtype = self.samples[idx]
+        path, pid, camid = self.samples[idx]
         img = Image.open(path).convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
-        if self.use_attributes:
-            return img, pid, camid, color, vtype
         return img, pid, camid
 
 
@@ -251,7 +178,7 @@ class BatchHardTripletLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Model: ResNet backbone + ID classifier + auxiliary color/type heads
+# Model: ResNet backbone + ID classifier
 # ---------------------------------------------------------------------------
 
 RESNET_FACTORY = {
@@ -263,22 +190,15 @@ RESNET_FACTORY = {
 
 class ResNetReID(nn.Module):
     """
-    Standard ReID model: ResNet backbone with pooled feature output,
-    a linear ID classifier, and two auxiliary classifiers for vehicle
-    color and type.
+    Standard ReID model: ResNet backbone with pooled feature output and a
+    linear ID classifier.
 
-    Train mode -> (id_logits, features, color_logits, type_logits)
+    Train mode -> (id_logits, features)
     Eval  mode -> features
     """
 
     def __init__(
-        self,
-        num_classes,
-        backbone="resnet50",
-        num_colors=NUM_COLORS,
-        num_types=NUM_TYPES,
-        pretrained=True,
-        last_stride_one=True,
+        self, num_classes, backbone="resnet50", pretrained=True, last_stride_one=True
     ):
         super().__init__()
         if backbone not in RESNET_FACTORY:
@@ -311,21 +231,13 @@ class ResNetReID(nn.Module):
 
         self.backbone = net
         self.feat_dim = feat_dim
-
         self.classifier = nn.Linear(feat_dim, num_classes)
-        self.color_head = nn.Linear(feat_dim, num_colors)
-        self.type_head = nn.Linear(feat_dim, num_types)
 
     def forward(self, x):
         features = self.backbone(x)  # (B, feat_dim) after GAP
         if not self.training:
             return features
-        return (
-            self.classifier(features),
-            features,
-            self.color_head(features),
-            self.type_head(features),
-        )
+        return self.classifier(features), features
 
 
 # ---------------------------------------------------------------------------
@@ -337,8 +249,7 @@ class ResNetReID(nn.Module):
 def extract_features(model, loader, device):
     model.eval()
     feats, pids, camids = [], [], []
-    for batch in loader:
-        imgs, pid, camid = batch[0], batch[1], batch[2]
+    for imgs, pid, camid in loader:
         imgs = imgs.to(device, non_blocking=True)
         f = model(imgs)
         f = F.normalize(f, dim=1)
@@ -381,9 +292,8 @@ def get_transforms(img_h, img_w):
         [
             transforms.Resize((img_h, img_w)),
             transforms.RandomHorizontalFlip(p=0.5),
-            # Vehicle-specific: color is a strong identity cue, so we want the
-            # model to be robust to camera color reproduction differences without
-            # destroying the color signal entirely. Mild jitter is the sweet spot.
+            # Mild color jitter helps the model generalize across cameras with
+            # different color reproduction.
             transforms.ColorJitter(
                 brightness=0.2, contrast=0.15, saturation=0.15, hue=0.05
             ),
@@ -446,9 +356,7 @@ def main():
     )
     parser.add_argument("--img-h", type=int, default=256)
     parser.add_argument("--img-w", type=int, default=256)
-    # 250 epochs is the canonical ReID schedule (Bag-of-Tricks recipe). 120
-    # is a reasonable time/quality compromise.
-    parser.add_argument("--epochs", type=int, default=250)
+    parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument(
         "--pretrained-weights",
         default=None,
@@ -462,8 +370,6 @@ def main():
     parser.add_argument("--lr", type=float, default=3.5e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--margin", type=float, default=0.3)
-    parser.add_argument("--aux-weight-color", type=float, default=0.5)
-    parser.add_argument("--aux-weight-type", type=float, default=0.5)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
@@ -482,7 +388,7 @@ def main():
     train_tf, test_tf = get_transforms(args.img_h, args.img_w)
     pin = device.type == "cuda"
 
-    train_ds = VeRi776(args.data_root, "train", transform=train_tf, use_attributes=True)
+    train_ds = VeRi776(args.data_root, "train", transform=train_tf)
     query_ds = VeRi776(args.data_root, "query", transform=test_tf)
     gallery_ds = VeRi776(args.data_root, "gallery", transform=test_tf)
     print(f"Train:   {len(train_ds):>6} imgs / {train_ds.num_classes} ids")
@@ -504,7 +410,6 @@ def main():
     model = ResNetReID(
         num_classes=train_ds.num_classes,
         backbone=args.model_name,
-        # Skip torchvision's auto-download when local weights are provided.
         pretrained=(args.pretrained_weights is None),
     ).to(device)
     if args.pretrained_weights is not None:
@@ -535,23 +440,14 @@ def main():
         running = defaultdict(float)
         t0 = time.time()
 
-        for imgs, pids, _, colors, types in train_loader:
+        for imgs, pids, _ in train_loader:
             imgs = imgs.to(device, non_blocking=True)
             pids = pids.to(device, non_blocking=True)
-            colors = colors.to(device, non_blocking=True)
-            types = types.to(device, non_blocking=True)
 
-            id_logits, features, color_logits, type_logits = model(imgs)
+            id_logits, features = model(imgs)
             l_ce = ce_loss(id_logits, pids)
             l_tri = tri_loss(features, pids)
-            l_col = F.cross_entropy(color_logits, colors)
-            l_typ = F.cross_entropy(type_logits, types)
-            loss = (
-                l_ce
-                + l_tri
-                + args.aux_weight_color * l_col
-                + args.aux_weight_type * l_typ
-            )
+            loss = l_ce + l_tri
 
             optimizer.zero_grad()
             loss.backward()
@@ -560,8 +456,6 @@ def main():
             bs = imgs.size(0)
             running["ce"] += l_ce.item() * bs
             running["tri"] += l_tri.item() * bs
-            running["col"] += l_col.item() * bs
-            running["typ"] += l_typ.item() * bs
             running["total"] += loss.item() * bs
             running["n"] += bs
 
@@ -572,8 +466,6 @@ def main():
             f"lr={optimizer.param_groups[0]['lr']:.2e}  "
             f"ce={running['ce'] / n:.4f}  "
             f"tri={running['tri'] / n:.4f}  "
-            f"col={running['col'] / n:.4f}  "
-            f"typ={running['typ'] / n:.4f}  "
             f"total={running['total'] / n:.4f}  "
             f"time={time.time() - t0:.1f}s"
         )
@@ -605,8 +497,8 @@ def main():
 
     # Produce a deployment-ready, backbone-only checkpoint from the best
     # mAP weights. This is what you'll feed into ONNX export / TensorRT
-    # INT8 calibration later -- the aux heads and ID classifier are
-    # training-time scaffolding that doesn't ship.
+    # INT8 calibration later -- the ID classifier is training-time
+    # scaffolding that doesn't ship.
     if best_path.is_file():
         ckpt = torch.load(best_path, map_location="cpu")
         full_state = ckpt["state_dict"]
