@@ -139,6 +139,7 @@ class VeRi776(Dataset):
             attrs = parse_veri_xml(xml_path)
 
         samples, pids = [], set()
+        n_missing_attrs = 0
         for fn in sorted(os.listdir(img_dir)):
             if not fn.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
@@ -147,10 +148,20 @@ class VeRi776(Dataset):
                 continue
             pid, camid = parsed
             color, vtype = -1, -1
-            if attrs is not None and fn in attrs:
-                _, _, color, vtype = attrs[fn]
+            if attrs is not None:
+                if fn in attrs:
+                    _, _, color, vtype = attrs[fn]
+                else:
+                    n_missing_attrs += 1
             samples.append([str(img_dir / fn), pid, camid, color, vtype])
             pids.add(pid)
+
+        if attrs is not None and n_missing_attrs > 0:
+            print(
+                f"  warning: {n_missing_attrs}/{len(samples)} {split} "
+                f"images missing XML entries; their aux color/type loss "
+                f"is masked out via ignore_index=-1."
+            )
 
         if split == "train":
             if pid2label is None:
