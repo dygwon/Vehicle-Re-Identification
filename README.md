@@ -2,6 +2,8 @@
 
 ## Overview
 
+Models can be found on huggingface under the [Vehicle Re-Identification](https://huggingface.co/collections/dgwon/vehicle-re-identification) collection.
+
 ## Data
 
 ### Object Detection
