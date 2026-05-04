@@ -11,7 +11,7 @@ ONNX_PATH    = "resnet34_veri776.onnx"
 NUM_CLASSES  = 576          # VeRi-776 train identities
 INPUT_H      = 256
 INPUT_W      = 256
-EXPORT_FEATS = False        # True -> output 512-d embeddings (drop fc)
+EXPORT_FEATS = True        # True -> output 512-d embeddings (drop fc)
 OPSET        = 17
 # ---------------------------------------
 
