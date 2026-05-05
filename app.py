@@ -1,15 +1,11 @@
 """
 Vehicle Re-Identification Pipeline for Jetson Orin Nano
 =======================================================
-- YOLOv8s INT8 TensorRT engine   (detection + ByteTrack via Ultralytics)
+- YOLOv8s FP16 TensorRT engine   (detection + ByteTrack via Ultralytics)
 - ResNet-34 INT8 TensorRT engine (re-id features)
 - FAISS IndexFlatIP gallery with 24h TTL  (cosine sim on L2-normalized vecs)
 
 Tested target: JetPack 6.x  (TensorRT >= 8.5, CUDA 12), Python 3.10+
-
-Dependencies:
-    pip install ultralytics faiss-cpu opencv-python
-    # tensorrt + pycuda are provided by JetPack
 """
 
 import time
@@ -18,9 +14,8 @@ from collections import deque
 import cv2
 import faiss
 import numpy as np
-import pycuda.autoinit  # noqa: F401  -- creates/attaches the primary CUDA ctx
-import pycuda.driver as cuda
 import tensorrt as trt
+import torch
 from ultralytics import YOLO
 
 
@@ -57,8 +52,7 @@ TRACK_GC_INTERVAL = 30
 TRACK_TTL         = 5.0          # forget a track this long after last sighting
 
 # --- I/O -------------------------------------------------------------------
-DISPLAY      = True
-PROCESS_SIZE = (960, 540)        # downscale incoming frames to this (W, H)
+DISPLAY = True
 
 
 # =============================================================================
@@ -66,7 +60,20 @@ PROCESS_SIZE = (960, 540)        # downscale incoming frames to this (W, H)
 # =============================================================================
 
 class TRTEngine:
-    """Single-input / single-output TRT runner with pinned host buffers."""
+    """Single-input / single-output TRT runner using PyTorch CUDA buffers.
+
+    Using torch tensors (instead of pycuda) keeps everything in the same
+    CUDA context Ultralytics/PyTorch already manages, which avoids hard-to-
+    diagnose conflicts during YOLO streaming inference.
+    """
+
+    _NP_TO_TORCH = {
+        np.dtype(np.float32): torch.float32,
+        np.dtype(np.float16): torch.float16,
+        np.dtype(np.int8):    torch.int8,
+        np.dtype(np.int32):   torch.int32,
+        np.dtype(np.uint8):   torch.uint8,
+    }
 
     def __init__(self, engine_path: str):
         logger  = trt.Logger(trt.Logger.WARNING)
@@ -77,9 +84,9 @@ class TRTEngine:
             raise RuntimeError(f"Failed to load TRT engine {engine_path}")
 
         self.context = self.engine.create_execution_context()
-        self.stream  = cuda.Stream()
+        self.stream  = torch.cuda.Stream()
 
-        # TRT 8.5+ tensor-name API (replaces binding indices)
+        # Tensor names (TRT >= 8.5)
         self.in_name  = self.engine.get_tensor_name(0)
         self.out_name = self.engine.get_tensor_name(1)
 
@@ -91,24 +98,26 @@ class TRTEngine:
 
         self.in_shape, self.out_shape = in_shape, out_shape
 
-        in_dtype  = trt.nptype(self.engine.get_tensor_dtype(self.in_name))
-        out_dtype = trt.nptype(self.engine.get_tensor_dtype(self.out_name))
+        in_np  = trt.nptype(self.engine.get_tensor_dtype(self.in_name))
+        out_np = trt.nptype(self.engine.get_tensor_dtype(self.out_name))
+        in_dt  = self._NP_TO_TORCH[np.dtype(in_np)]
+        out_dt = self._NP_TO_TORCH[np.dtype(out_np)]
 
-        self.h_in  = cuda.pagelocked_empty(int(np.prod(in_shape)),  in_dtype)
-        self.h_out = cuda.pagelocked_empty(int(np.prod(out_shape)), out_dtype)
-        self.d_in  = cuda.mem_alloc(self.h_in.nbytes)
-        self.d_out = cuda.mem_alloc(self.h_out.nbytes)
+        # GPU buffers as torch tensors, owned by torch's allocator
+        self.d_in  = torch.empty(in_shape,  dtype=in_dt,  device="cuda")
+        self.d_out = torch.empty(out_shape, dtype=out_dt, device="cuda")
 
-        self.context.set_tensor_address(self.in_name,  int(self.d_in))
-        self.context.set_tensor_address(self.out_name, int(self.d_out))
+        self.context.set_tensor_address(self.in_name,  self.d_in.data_ptr())
+        self.context.set_tensor_address(self.out_name, self.d_out.data_ptr())
 
     def infer(self, x: np.ndarray) -> np.ndarray:
-        np.copyto(self.h_in, x.ravel())
-        cuda.memcpy_htod_async(self.d_in, self.h_in, self.stream)
-        self.context.execute_async_v3(self.stream.handle)
-        cuda.memcpy_dtoh_async(self.h_out, self.d_out, self.stream)
+        x_t = torch.from_numpy(np.ascontiguousarray(x).reshape(self.in_shape))
+        with torch.cuda.stream(self.stream):
+            self.d_in.copy_(x_t, non_blocking=True)
+            self.context.execute_async_v3(self.stream.cuda_stream)
+            out = self.d_out.detach().cpu()
         self.stream.synchronize()
-        return self.h_out.reshape(self.out_shape).copy()
+        return out.numpy()
 
 
 # =============================================================================
@@ -118,7 +127,6 @@ class TRTEngine:
 class ResNetExtractor:
     def __init__(self, engine_path: str):
         self.engine = TRTEngine(engine_path)
-        # Embedding dimensionality = product of all non-batch dims of output.
         self.dim = int(np.prod(self.engine.out_shape[1:]))
 
     def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
@@ -202,6 +210,53 @@ def draw_track(frame, box, state):
 
 
 # =============================================================================
+# Source iterators -- both yield Ultralytics `Results` objects
+# =============================================================================
+
+def _camera_results_iter(pipeline_str, detector):
+    """CSI camera -> per-frame detector results.
+
+    We open the capture ourselves with CAP_GSTREAMER (Ultralytics' default
+    VideoCapture call doesn't reliably auto-detect GStreamer pipelines on
+    Jetson), then drive detection one frame at a time.
+    """
+    cap = cv2.VideoCapture(pipeline_str, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera: {pipeline_str}")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                return
+            yield detector.track(
+                frame,
+                persist=True,
+                conf=DETECT_CONF,
+                tracker="bytetrack.yaml",
+                verbose=False,
+            )[0]
+    finally:
+        cap.release()
+
+
+def _file_results_iter(path, detector):
+    """File -> per-frame detector results, with Ultralytics handling I/O.
+
+    Manually feeding `cap.read()` frames into `detector.track(np_array)`
+    triggers TRT Cask convolution errors on TRT 10.x for non-trivial inputs.
+    Letting Ultralytics own the source loader avoids that path entirely.
+    """
+    return detector.track(
+        source=path,
+        stream=True,
+        persist=True,
+        conf=DETECT_CONF,
+        tracker="bytetrack.yaml",
+        verbose=False,
+    )
+
+
+# =============================================================================
 # Main pipeline
 # =============================================================================
 
@@ -215,118 +270,96 @@ def run_pipeline(video_source, use_gstreamer=True):
 
     db = VectorDB(dim=extractor.dim)
 
-    backend = cv2.CAP_GSTREAMER if use_gstreamer else cv2.CAP_ANY
-    cap = cv2.VideoCapture(video_source, backend)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video source: {video_source}")
-
-    track_state   = {}     # tid -> {verdict, score, last_extracted, last_seen}
+    track_state   = {}
     last_cleanup  = time.time()
     last_track_gc = time.time()
     fps_buf       = deque(maxlen=30)
 
+    if use_gstreamer:
+        results_iter = _camera_results_iter(video_source, detector)
+    else:
+        results_iter = _file_results_iter(video_source, detector)
+
     print("Pipeline running. Press 'q' to quit.\n")
 
-    while True:
-        t0 = time.time()
-        ok, frame = cap.read()
-        if not ok:
-            print("Stream ended.")
-            break
+    try:
+        for results in results_iter:
+            t0 = time.time()
+            now = t0
+            frame = results.orig_img.copy()
 
-        # Normalize the input frame: downscale anything larger than our
-        # processing size, and force contiguous memory. Ultralytics' TRT
-        # path is finicky about both.
-        if (frame.shape[1], frame.shape[0]) != PROCESS_SIZE:
-            frame = cv2.resize(frame, PROCESS_SIZE, interpolation=cv2.INTER_AREA)
-        frame = np.ascontiguousarray(frame)
+            # --- 1. Process detections ---------------------------------------
+            if results.boxes is not None and results.boxes.id is not None:
+                xyxy      = results.boxes.xyxy.cpu().numpy().astype(int)
+                track_ids = results.boxes.id.cpu().numpy().astype(int)
 
-        now = time.time()
+                for box, tid in zip(xyxy, track_ids):
+                    tid = int(tid)
+                    state = track_state.setdefault(tid, {
+                        "verdict": None,
+                        "score":   0.0,
+                        "last_extracted": 0.0,
+                        "last_seen":      now,
+                    })
+                    state["last_seen"] = now
 
-        # --- 1. Detect + track --------------------------------------------------
-        results = detector.track(
-            frame,
-            persist=True,
-            conf=DETECT_CONF,
-            tracker="bytetrack.yaml",
-            verbose=False,
-        )[0]
+                    draw_track(frame, box, state)
 
-        if results.boxes.id is not None:
-            xyxy      = results.boxes.xyxy.cpu().numpy().astype(int)
-            track_ids = results.boxes.id.cpu().numpy().astype(int)
+                    if state["verdict"] is not None:
+                        continue
+                    if now - state["last_extracted"] < EXTRACTION_COOLDOWN:
+                        continue
+                    x1, y1, x2, y2 = box
+                    if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
+                        continue
 
-            for box, tid in zip(xyxy, track_ids):
-                tid = int(tid)
-                state = track_state.setdefault(tid, {
-                    "verdict": None,
-                    "score":   0.0,
-                    "last_extracted": 0.0,
-                    "last_seen":      now,
-                })
-                state["last_seen"] = now
+                    h, w = frame.shape[:2]
+                    cx1, cy1 = max(0, x1), max(0, y1)
+                    cx2, cy2 = min(w, x2), min(h, y2)
+                    crop = frame[cy1:cy2, cx1:cx2]
+                    if crop.size == 0:
+                        continue
 
-                draw_track(frame, box, state)
+                    emb = extractor.extract(crop)
+                    seen, score, _ = db.search(emb)
+                    state["last_extracted"] = now
+                    state["score"] = score
 
-                # --- 2. Decide whether to extract features for this track ------
-                if state["verdict"] is not None:
-                    continue                                     # already decided
-                if now - state["last_extracted"] < EXTRACTION_COOLDOWN:
-                    continue
-                x1, y1, x2, y2 = box
-                if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
-                    continue
+                    if seen:
+                        state["verdict"] = "SEEN"
+                    else:
+                        db.add(emb)
+                        state["verdict"] = "NEW"
 
-                # Clamp to frame bounds (boxes can run a couple px over)
-                h, w = frame.shape[:2]
-                cx1, cy1 = max(0, x1), max(0, y1)
-                cx2, cy2 = min(w, x2), min(h, y2)
-                crop = frame[cy1:cy2, cx1:cx2]
-                if crop.size == 0:
-                    continue
+            # --- 2. Maintenance ----------------------------------------------
+            if now - last_cleanup > CLEANUP_INTERVAL:
+                removed = db.cleanup()
+                if removed:
+                    print(f"[gallery] removed {removed} expired vectors "
+                          f"(remaining: {db.index.ntotal})")
+                last_cleanup = now
 
-                # --- 3. Embed + search/insert ---------------------------------
-                emb = extractor.extract(crop)
-                seen, score, _ = db.search(emb)
-                state["last_extracted"] = now
-                state["score"] = score
+            if now - last_track_gc > TRACK_GC_INTERVAL:
+                stale = [tid for tid, s in track_state.items()
+                         if now - s["last_seen"] > TRACK_TTL]
+                for tid in stale:
+                    del track_state[tid]
+                last_track_gc = now
 
-                if seen:
-                    state["verdict"] = "SEEN"
-                else:
-                    db.add(emb)
-                    state["verdict"] = "NEW"
+            # --- 3. HUD ------------------------------------------------------
+            fps_buf.append(time.time() - t0)
+            fps = len(fps_buf) / max(sum(fps_buf), 1e-6)
+            cv2.putText(frame,
+                        f"{fps:5.1f} FPS  |  gallery: {db.index.ntotal}",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        (255, 255, 255), 2)
 
-        # --- 4. Maintenance -----------------------------------------------------
-        if now - last_cleanup > CLEANUP_INTERVAL:
-            removed = db.cleanup()
-            if removed:
-                print(f"[gallery] removed {removed} expired vectors "
-                      f"(remaining: {db.index.ntotal})")
-            last_cleanup = now
-
-        if now - last_track_gc > TRACK_GC_INTERVAL:
-            stale = [tid for tid, s in track_state.items()
-                     if now - s["last_seen"] > TRACK_TTL]
-            for tid in stale:
-                del track_state[tid]
-            last_track_gc = now
-
-        # --- 5. HUD -------------------------------------------------------------
-        fps_buf.append(time.time() - t0)
-        fps = len(fps_buf) / max(sum(fps_buf), 1e-6)
-        cv2.putText(frame,
-                    f"{fps:5.1f} FPS  |  gallery: {db.index.ntotal}",
-                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                    (255, 255, 255), 2)
-
-        if DISPLAY:
-            cv2.imshow("Re-ID Pipeline", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-    cap.release()
-    cv2.destroyAllWindows()
+            if DISPLAY:
+                cv2.imshow("Re-ID Pipeline", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    finally:
+        cv2.destroyAllWindows()
 
 
 # =============================================================================
