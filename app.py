@@ -29,7 +29,7 @@ from ultralytics import YOLO
 # =============================================================================
 
 # --- Engines ---------------------------------------------------------------
-YOLO_ENGINE   = "engines/best_detect_int8.engine"
+YOLO_ENGINE   = "engines/best_detect_fp16.engine"
 RESNET_ENGINE = "engines/resnet34_veri776_int8.engine"
 
 # --- Detection -------------------------------------------------------------
