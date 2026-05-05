@@ -10,8 +10,6 @@
   CPU mean freq (MHz)      mean   1444.3  min  1062.0  max  1728.0
   GPU (%)                  mean     54.8  min    27.0  max    81.0
 
--- Thermal --
-
 -- Power --
   Total board (mW)         mean   8415.6  min  8094.0  max  9151.0
   CPU+GPU+CV (mW)          mean   2859.8  min  2610.0  max  3395.0
