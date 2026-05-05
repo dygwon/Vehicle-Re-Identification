@@ -1,0 +1,9 @@
+names:
+- car
+- motorcycle
+- bus
+- truck
+nc: 4
+path: /scratch/da32459/repos/personal/vehicle-re-identification/detection
+train: images/train
+val: images/val
