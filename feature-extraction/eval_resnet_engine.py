@@ -96,7 +96,7 @@ def extract(infer, img_dir, name_list_path):
         imgs = np.stack([preprocess(Image.open(p)) for p in paths[start:end]])
         feats[start:end] = infer.infer(imgs)
 
-    # L2-normalize defensively (your engine may already do this)
+    # L2-normalize defensively (not performed earlier)
     feats /= np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12
     return feats, pids, cids
 

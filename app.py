@@ -5,7 +5,7 @@ Vehicle Re-Identification Pipeline for Jetson Orin Nano
 - ResNet-34 INT8 TensorRT engine (re-id features)
 - FAISS IndexFlatIP gallery with 24h TTL  (cosine sim on L2-normalized vecs)
 
-Tested target: JetPack 6.x  (TensorRT >= 8.5, CUDA 12), Python 3.10+
+Tested target: JetPack 6.2  (TensorRT == 10.3, CUDA 12.6), Python 3.10
 """
 
 import time
@@ -46,7 +46,7 @@ EXTRACTION_COOLDOWN = 0.5
 
 # --- Gallery TTL -----------------------------------------------------------
 TTL_SECONDS      = 24 * 3600
-CLEANUP_INTERVAL = 600           # purge expired vectors every 10 min
+CLEANUP_INTERVAL = 600           # check for expired vectors every 10 min
 
 # --- Tracker bookkeeping ---------------------------------------------------
 TRACK_GC_INTERVAL = 30

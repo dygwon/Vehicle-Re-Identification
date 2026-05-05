@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
-# ---- adjust to match your finetune ----
+# ---- adjust ----
 CHECKPOINT = "checkpoints/resnet34_veri776_deploy.pt"
 ONNX_PATH = "resnet34_veri776.onnx"
 NUM_CLASSES = 576  # VeRi-776 train identities

@@ -8,17 +8,6 @@ Usage:
     python finetune_resnet_veri776.py --data-root /path/to/VeRi
 
 Dependencies: torch, torchvision, pillow, numpy.
-
-Notes for the eventual INT8 / Jetson Orin Nano deployment path:
-  * The deployment checkpoint contains the bare feature extractor only;
-    the ID classifier is dropped at export time.
-  * `resnet50` is the standard ReID workhorse. Use `resnet18` or `resnet34`
-    for a smaller / faster model if Orin Nano latency is tight.
-  * Train at the resolution you intend to deploy at; static shapes are
-    kinder to TensorRT INT8 calibration.
-  * State_dict checkpoints throughout, so loading into the same architecture
-    for ONNX export, PTQ calibration, or QAT is straightforward.
-  * Only ReLU + BatchNorm + standard convs -- all map to native INT8 ops.
 """
 
 import argparse
@@ -523,9 +512,7 @@ def main():
             os.fsync(f.fileno())
 
     # Produce a deployment-ready, backbone-only checkpoint from the best
-    # mAP weights. This is what you'll feed into ONNX export / TensorRT
-    # INT8 calibration later -- the ID classifier is training-time
-    # scaffolding that doesn't ship.
+    # mAP weights.
     if best_path.is_file():
         ckpt = torch.load(best_path, map_location="cpu")
         full_state = ckpt["state_dict"]
