@@ -2,7 +2,15 @@
 
 ## Overview
 
-Models can be found on huggingface under the [Vehicle Re-Identification](https://huggingface.co/collections/dgwon/vehicle-re-identification) collection.
+Models (full finetuned and onnx exports) can be found on huggingface under the [Vehicle Re-Identification](https://huggingface.co/collections/dgwon/vehicle-re-identification) collection. Model engines built for the target device can be found in this repository under the `engines/` directory.
+
+## Environment Setup
+
+```bash
+$ conda create -n reid python=3.10 -y
+$ conda activate reid
+$ pip install python-dotenv ultralytics fiftyone torch torchvision pillow numpy onnx onnxscript
+```
 
 ## Data
 
@@ -10,21 +18,34 @@ Models can be found on huggingface under the [Vehicle Re-Identification](https:/
 
 **coco-2017**
 
-Subsetted to four classes: cars, trucks, motorcycles, 
+This dataset will be downloaded when running object detection training notebook.
+
+Subsetted to four classes: cars, motorcycle, bus, and truck
 
 ### Feature Extraction
 
-VeRi-776
+**VeRi-776**
+
+A zip file for this dataset can be found at [dgwon/resnet-34-veri776-onnx](https://huggingface.co/dgwon/resnet-34-veri776-onnx)
 
 ## Models
 
+All model training was completed on one RTX A6000.
+
 ### Object Detection
 
-yolov8s
+**yolov8s**
+
+- training: `detection/train-object-detection.ipynb` (run this notebook)
 
 ### Feature Extraction
 
-resnet-34
+**resnet-34**
+
+- training: `python feature-extraction/finetune_resnet_veri776.py --data-root /PATH/TO/VERI/`
+- sample calibration data: `python feature-extraction/sample_calib_resnet.py`
+- export to onnx: `python export_resnet_onnx.py`
+- evaluate target build: `python feature-extraction/eval_resnet_engine.py`
 
 ## Target
 
