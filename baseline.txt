@@ -1,0 +1,21 @@
+=== baseline  (40 samples over 20.3s) ===
+
+-- Memory --
+  RAM used (MB)            mean   3114.9  min  3061.0  max  3163.0
+  Swap used (MB)           mean    425.0  min   425.0  max   425.0
+
+-- Compute --
+  CPU mean across cores (%) mean      7.4  min     4.7  max    17.2
+  CPU hottest core (%)     mean     26.4  min    15.0  max    86.0
+  CPU mean freq (MHz)      mean    883.3  min   729.0  max  1728.0
+  GPU (%)                  mean      2.2  min     0.0  max    35.0
+
+-- Thermal --
+
+-- Power --
+  Total board (mW)         mean   5240.4  min  5198.0  max  5793.0
+  CPU+GPU+CV (mW)          mean    652.9  min   633.0  max  1109.0
+  SoC (mW)                 mean   1586.0  min  1584.0  max  1626.0
+
+  Estimated energy this window: 106.3 J  (5.24 W avg over 20.3s)
+
