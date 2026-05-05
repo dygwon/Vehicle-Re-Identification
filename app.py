@@ -57,7 +57,8 @@ TRACK_GC_INTERVAL = 30
 TRACK_TTL         = 5.0          # forget a track this long after last sighting
 
 # --- I/O -------------------------------------------------------------------
-DISPLAY = True
+DISPLAY      = True
+PROCESS_SIZE = (960, 540)        # downscale incoming frames to this (W, H)
 
 
 # =============================================================================
@@ -232,6 +233,13 @@ def run_pipeline(video_source, use_gstreamer=True):
         if not ok:
             print("Stream ended.")
             break
+
+        # Normalize the input frame: downscale anything larger than our
+        # processing size, and force contiguous memory. Ultralytics' TRT
+        # path is finicky about both.
+        if (frame.shape[1], frame.shape[0]) != PROCESS_SIZE:
+            frame = cv2.resize(frame, PROCESS_SIZE, interpolation=cv2.INTER_AREA)
+        frame = np.ascontiguousarray(frame)
 
         now = time.time()
 
