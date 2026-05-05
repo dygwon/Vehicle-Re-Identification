@@ -2,15 +2,14 @@ import os
 import re
 
 import numpy as np
-import pycuda.autoinit  # noqa: F401
-import pycuda.driver as cuda
 import tensorrt as trt
+import torch
 from PIL import Image
 from tqdm import tqdm
 
 # ---- adjust ----
-ENGINE_PATH = "resnet34_veri776_int8.engine"
-VERI_ROOT = "data/veri"
+ENGINE_PATH = "/home/dan/repos/Vehicle-Re-Identification/engines/resnet34_veri776_int8.engine"
+VERI_ROOT = "/home/dan/repos/Vehicle-Re-Identification/data/veri"
 QUERY_LIST = os.path.join(VERI_ROOT, "name_query.txt")
 GALLERY_LIST = os.path.join(VERI_ROOT, "name_test.txt")
 QUERY_DIR = os.path.join(VERI_ROOT, "image_query")
@@ -56,21 +55,32 @@ class TRTInfer:
             else:
                 self.out_name = n
 
-        self.stream = cuda.Stream()
-        self.d_in = cuda.mem_alloc(BATCH * 3 * INPUT_H * INPUT_W * 4)
-        self.d_out = cuda.mem_alloc(BATCH * EMBED_DIM * 4)
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device not available")
+        self.device = torch.device("cuda")
+        self.stream = torch.cuda.Stream(device=self.device)
+
+        # pre-allocate max-batch device buffers; reuse via slices for smaller batches
+        self.d_in = torch.empty(
+            (BATCH, 3, INPUT_H, INPUT_W), dtype=torch.float32, device=self.device
+        )
+        self.d_out = torch.empty(
+            (BATCH, EMBED_DIM), dtype=torch.float32, device=self.device
+        )
+        # tensor addresses are stable for the lifetime of the buffers
+        self.context.set_tensor_address(self.in_name, self.d_in.data_ptr())
+        self.context.set_tensor_address(self.out_name, self.d_out.data_ptr())
 
     def infer(self, batch):
         bs = batch.shape[0]
-        self.context.set_input_shape(self.in_name, batch.shape)
-        out = np.empty((bs, EMBED_DIM), dtype=np.float32)
-        cuda.memcpy_htod_async(self.d_in, np.ascontiguousarray(batch), self.stream)
-        self.context.set_tensor_address(self.in_name, int(self.d_in))
-        self.context.set_tensor_address(self.out_name, int(self.d_out))
-        self.context.execute_async_v3(self.stream.handle)
-        cuda.memcpy_dtoh_async(out, self.d_out, self.stream)
+        self.context.set_input_shape(self.in_name, tuple(batch.shape))
+
+        host = torch.from_numpy(np.ascontiguousarray(batch))
+        with torch.cuda.stream(self.stream):
+            self.d_in[:bs].copy_(host, non_blocking=False)
+            self.context.execute_async_v3(self.stream.cuda_stream)
         self.stream.synchronize()
-        return out
+        return self.d_out[:bs].cpu().numpy()
 
 
 def extract(infer, img_dir, name_list_path):
