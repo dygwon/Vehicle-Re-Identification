@@ -23,6 +23,7 @@ import pycuda.driver as cuda
 import tensorrt as trt
 from ultralytics import YOLO
 
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -342,6 +343,20 @@ def gstreamer_pipeline(
 
 
 if __name__ == "__main__":
-    src = gstreamer_pipeline(flip_method=0)
-    print("GStreamer pipeline:\n" + src + "\n")
-    run_pipeline(src, use_gstreamer=True)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Vehicle Re-ID pipeline")
+    parser.add_argument("--source", "-s", default=None,
+                        help="Path to a video file. If omitted, uses the CSI "
+                             "camera via GStreamer.")
+    parser.add_argument("--flip", type=int, default=0,
+                        help="GStreamer flip-method (0-3) for the CSI camera.")
+    args = parser.parse_args()
+
+    if args.source:
+        print(f"Reading from file: {args.source}\n")
+        run_pipeline(args.source, use_gstreamer=False)
+    else:
+        src = gstreamer_pipeline(flip_method=args.flip)
+        print("GStreamer pipeline:\n" + src + "\n")
+        run_pipeline(src, use_gstreamer=True)
